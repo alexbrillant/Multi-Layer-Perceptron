@@ -1,17 +1,22 @@
+import os
+from enum import Enum
+
 import numpy as np
 import tensorflow as tf
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import NearMiss
 from neuraxle.base import Identity, BaseStep, NonFittableMixin
-from neuraxle.hyperparams.space import HyperparameterSamples
+from neuraxle.hyperparams.distributions import Choice, LogUniform, RandInt, FixedHyperparameter, Uniform
+from neuraxle.hyperparams.space import HyperparameterSamples, HyperparameterSpace
 from neuraxle.metaopt.auto_ml import AutoML, RandomSearchHyperparameterSelectionStrategy, ValidationSplitter, \
     InMemoryHyperparamsRepository
-from neuraxle.metaopt.callbacks import ScoringCallback
+from neuraxle.metaopt.callbacks import ScoringCallback, MetricCallback
 from neuraxle.pipeline import Pipeline, MiniBatchSequentialPipeline
 from neuraxle.steps.data import DataShuffler
 from neuraxle.steps.flow import TrainOnlyWrapper
 from neuraxle.steps.numpy import OneHotEncoder
 from neuraxle_tensorflow.tensorflow_v2 import Tensorflow2ModelStep
 from pandas import read_csv
-from sklearn.preprocessing import LabelEncoder
 from tensorflow_core.python.keras.engine.input_layer import Input
 from tensorflow_core.python.keras.layers.core import Dense
 from tensorflow_core.python.keras.losses import sparse_categorical_crossentropy
@@ -24,7 +29,11 @@ from tensorflow_core.python.keras.optimizer_v2.rmsprop import RMSProp
 from tensorflow_core.python.training.adam import AdamOptimizer
 
 from column_transformer_input_output import ColumnTransformerInputOutput
+from early_stopping_callback import EarlyStoppingCallback
+from metrics import precision_score_weighted, recall_score_weighted, f1_score_weighted, \
+    classificaiton_report_imbalanced_metric
 from output_transformer_wrapper import OutputTransformerWrapper
+import matplotlib.pyplot as plt
 
 
 def create_model(step: Tensorflow2ModelStep):
@@ -43,10 +52,22 @@ def create_model(step: Tensorflow2ModelStep):
     )
 
     dense_layers = [
-        Dense(units=step.hyperparams['hidden_dim'], activation='relu', kernel_initializer='he_normal',
-              input_shape=(step.hyperparams['input_dim'],)),
-        Dense(units=8, activation='relu', kernel_initializer='he_normal')
+        Dense(
+            units=step.hyperparams['hidden_dim'],
+            kernel_initializer=step.hyperparams['kernel_initializer'],
+            activation=step.hyperparams['activation'],
+            input_shape=(step.hyperparams['input_dim'],)
+        )
     ]
+
+    hidden_dim = step.hyperparams['hidden_dim']
+    for i in range(step.hyperparams['n_dense_layers'] - 1):
+        hidden_dim *= step.hyperparams['hidden_dim_layer_multiplier']
+        dense_layers.append(Dense(
+            units=int(hidden_dim),
+            activation=step.hyperparams['activation'],
+            kernel_initializer=step.hyperparams['kernel_initializer']
+        ))
 
     for layer in dense_layers:
         outputs = layer(inputs)
@@ -71,6 +92,28 @@ def create_loss(step: Tensorflow2ModelStep, expected_outputs, predicted_outputs)
         axis=-1
     )
 
+
+class OPTIMIZERS(Enum):
+    SGD = 'sgd'
+    ADAM = 'adam'
+    ADAGRAD = 'adagrad'
+    ADAMAX = 'adamax'
+    FTRL = 'ftrl'
+    NADAM = 'nadam'
+    RMSPROP = 'rms_prop'
+
+class ACTIVATIONS(Enum):
+    RELU = 'relu'
+    TANH = 'tanh'
+    SIGMOID = 'sigmoid'
+    LEAKY_RELU = 'leaky_relu'
+    ELU = 'elu'
+    PRELU = 'prelu'
+
+class KERNEL_INITIALIZERS(Enum):
+    GLOROT_NORMAL = 'glorot_normal'
+    GLOROT_UNIFORM = 'glorot_uniform'
+    HE_UNIFORM = 'he_uniform'
 
 def create_optimizer(step: Tensorflow2ModelStep):
     """
@@ -117,32 +160,90 @@ class ExpandDim(NonFittableMixin, BaseStep):
         return np.expand_dims(data_inputs, axis=-1)
 
 
+class PlotDistribution(NonFittableMixin, BaseStep):
+    def __init__(self, column):
+        BaseStep.__init__(self)
+        NonFittableMixin.__init__(self)
+        self.column = column
+
+    def transform(self, data_inputs):
+        if not os.path.exists('plots'):
+            os.makedirs('plots')
+        plt.hist(data_inputs[:, self.column])
+        plt.savefig(os.path.join('plots', self.name))
+        plt.close()
+        return data_inputs
+
+class Resample(NonFittableMixin, BaseStep):
+    def __init__(self, column):
+        BaseStep.__init__(self)
+        NonFittableMixin.__init__(self)
+        self.column = column
+
+    def transform(self, data_inputs):
+        NearMiss()
+        SMOTE()
+        return data_inputs
+
+
 def main():
     def accuracy(data_inputs, expected_outputs):
         return np.mean(np.argmax(np.array(data_inputs), axis=1) == np.argmax(np.array(expected_outputs), axis=1))
 
     # load the dataset
-    path = 'https://raw.githubusercontent.com/jbrownlee/Datasets/master/iris.csv'
-    df = read_csv(path, header=None)
+    df = read_csv('data/winequality-white.csv', sep=';')
     data_inputs = df.values
-    data_inputs[:, -1] = LabelEncoder().fit_transform(data_inputs[:, -1])
+    data_inputs[:, -1] = data_inputs[:, -1] - 1
     n_features = data_inputs.shape[1] - 1
-    n_classes = 3
+    n_classes = 10
 
     p = Pipeline([
         TrainOnlyWrapper(DataShuffler()),
         ColumnTransformerInputOutput(
-            input_columns=[([0, 1, 2, 3], ToNumpy(np.float32))],
-            output_columns=[(4, Identity())]
+            input_columns=[(
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], ToNumpy(np.float32)
+            )],
+            output_columns=[(11, Identity())]
         ),
+        OutputTransformerWrapper(PlotDistribution(column=-1)),
         MiniBatchSequentialPipeline([
-            Tensorflow2ModelStep(create_model=create_model, create_loss=create_loss, create_optimizer=create_optimizer) \
+            Tensorflow2ModelStep(
+                create_model=create_model,
+                create_loss=create_loss,
+                create_optimizer=create_optimizer
+            ) \
                 .set_hyperparams(HyperparameterSamples({
+                'n_dense_layers': 2,
                 'input_dim': n_features,
                 'optimizer': 'adam',
+                'activation': 'relu',
+                'kernel_initializer': 'he_uniform',
                 'learning_rate': 0.01,
                 'hidden_dim': 20,
                 'n_classes': 3
+            })).set_hyperparams_space(HyperparameterSpace({
+                'n_dense_layers': RandInt(2, 4),
+                'hidden_dim_layer_multiplier': Uniform(0.30, 1),
+                'input_dim': FixedHyperparameter(n_features),
+                'optimizer': Choice([
+                    OPTIMIZERS.ADAM.value,
+                    OPTIMIZERS.SGD.value,
+                    OPTIMIZERS.ADAGRAD.value
+                ]),
+                'activation': Choice([
+                    ACTIVATIONS.RELU.value,
+                    ACTIVATIONS.TANH.value,
+                    ACTIVATIONS.SIGMOID.value,
+                    ACTIVATIONS.ELU.value,
+                ]),
+                'kernel_initializer': Choice([
+                    KERNEL_INITIALIZERS.GLOROT_NORMAL.value,
+                    KERNEL_INITIALIZERS.GLOROT_UNIFORM.value,
+                    KERNEL_INITIALIZERS.HE_UNIFORM.value
+                ]),
+                'learning_rate': LogUniform(0.005, 0.01),
+                'hidden_dim': RandInt(3, 80),
+                'n_classes': FixedHyperparameter(n_classes)
             }))
         ], batch_size=33),
         OutputTransformerWrapper(Pipeline([
@@ -157,10 +258,17 @@ def main():
         hyperparams_repository=InMemoryHyperparamsRepository(cache_folder='trials'),
         hyperparams_optimizer=RandomSearchHyperparameterSelectionStrategy(),
         validation_splitter=ValidationSplitter(test_size=0.30),
-        scoring_callback=ScoringCallback(accuracy, higher_score_is_better=False),
-        n_trials=1,
+        scoring_callback=ScoringCallback(accuracy, higher_score_is_better=True),
+        callbacks=[
+            MetricCallback(name='classification_report_imbalanced_metric', metric_function=classificaiton_report_imbalanced_metric, higher_score_is_better=True),
+            MetricCallback(name='f1', metric_function=f1_score_weighted, higher_score_is_better=True),
+            MetricCallback(name='recall', metric_function=recall_score_weighted, higher_score_is_better=True),
+            MetricCallback(name='precision', metric_function=precision_score_weighted, higher_score_is_better=True),
+            EarlyStoppingCallback(max_epochs_without_improvement=3)
+        ],
+        n_trials=200,
         refit_trial=True,
-        epochs=150
+        epochs=75
     )
 
     auto_ml = auto_ml.fit(data_inputs=data_inputs)
